@@ -1,0 +1,477 @@
+---
+title: "EDA Modeling"
+author: "Nick Acosta"
+date: "2025-03-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Library Installations
+
+```{r}
+
+# Load libraries
+library(xgboost)
+library(dplyr)
+library(caret)
+library(tidyverse)
+library(readr)
+library(readxl)
+library(skimr)
+library(janitor)
+library(dplyr)
+library(ggcorrplot)
+library(car)
+```
+
+## Data Cleaning
+
+```{r}
+
+# Define file paths from Google Drive
+# old directory: /content/drive/MyDrive/MSBA-Capstone2025/Datasets/
+
+customer_profile_path <- "customer_profile.csv"
+transactional_data_path <- "transactional_data.csv"
+delivery_cost_data_path <- "delivery_cost_data.xlsx"
+customer_address_path <- "customer_address_and_zip_mapping.csv"
+
+# Read CSV files
+customer_profile <- read_csv(customer_profile_path)
+transactional_data <- read_csv(transactional_data_path)
+customer_address <- read_csv(customer_address_path)
+delivery_cost_data <- read_csv(delivery_cost_data_path)
+
+# Read Excel file
+delivery_cost_data <- read_excel(delivery_cost_data_path)
+```
+
+```{r}
+
+# Clean column names
+customer_address <- clean_names(customer_address)
+customer_profile <- clean_names(customer_profile)
+transactional_data <- clean_names(transactional_data)
+delivery_cost_data <- clean_names(delivery_cost_data)
+```
+
+## Check the Data Structure
+
+```{r}
+
+# Check the structure of datasets (customer_address)
+str(customer_address)
+
+# Check the structure of datasets (customer_profile)
+str(customer_profile)
+
+# Check the structure of datasets(transactional_data)
+str(transactional_data)
+
+# Check the structure of datasets (delivery_cost_data)
+str(delivery_cost_data)
+```
+
+## Convert the Data Types
+
+```{r}
+
+# Convert first_delivery_date and on_boarding_date from character strings to date format
+customer_profile <- customer_profile %>%
+  mutate(
+    first_delivery_date = as.Date(first_delivery_date, format="%m/%d/%Y"),
+    on_boarding_date = as.Date(on_boarding_date, format="%m/%d/%Y")
+  )
+
+# Convert transaction_date from character string to date format and customer_number from numeric to character
+transactional_data <- transactional_data %>%
+  mutate(
+    transaction_date = as.Date(transaction_date, format="%m/%d/%Y"),
+    customer_number = as.character(customer_number)
+  )
+
+  # Convert zip code from numeric to character
+customer_address <- customer_address %>%
+  mutate(zip = as.character(zip))
+```
+
+## Merged Data and Run Correlation Analysis
+
+```{r}
+
+# Read and clean transactional data
+transactional_data_cleaned <- read_csv("transactional_data.csv") %>%
+  clean_names() %>%  # Ensure column names are cleaned
+  select(-ordered_cases, -loaded_cases, -ordered_gallons, -loaded_gallons)  # Remove redundant variables
+
+# Read and clean other datasets
+customer_profile <- read_csv("customer_profile.csv") %>%
+  clean_names()
+
+delivery_cost_data <- read_excel("delivery_cost_data.xlsx") %>%
+  clean_names()
+```
+
+```{r}
+
+# Merge Customer Profile Data
+merged_data <- transactional_data_cleaned %>%
+  left_join(customer_profile, by = "customer_number")
+
+# Merge Delivery Cost Data
+delivery_cost_data_cleaned <- delivery_cost_data %>%
+  group_by(cold_drink_channel) %>%
+  summarize(median_delivery_cost = mean(median_delivery_cost, na.rm = TRUE))  # Ensure correct column names
+
+# Now perform the merge with the cleaned data
+merged_data <- merged_data %>%
+  left_join(delivery_cost_data_cleaned, by = "cold_drink_channel")
+```
+
+## Rerun Correlation Analysis
+
+```{r}
+
+# Select numeric columns only
+numeric_cols_merged <- merged_data %>% select(where(is.numeric))
+
+# Compute new correlation matrix
+cor_matrix_merged <- cor(numeric_cols_merged, use = "pairwise.complete.obs")
+
+# Visualize updated correlation matrix
+ggcorrplot(cor_matrix_merged, method = "circle", type = "lower",
+           lab = TRUE, lab_size = 3, title = "Correlation Matrix After Merging Data")
+```
+
+## Prepare the Data for the Decision Tree Model
+
+```{r}
+
+library(tidyverse)
+library(rpart)
+library(rpart.plot)
+library(caret)
+
+# Ensure categorical variables are factors
+merged_data_svr <- merged_data %>%
+  mutate(across(where(is.character), as.factor))
+
+# Remove rows with missing values (or impute if necessary)
+merged_data_svr <- na.omit(merged_data_svr)
+
+```
+
+```
+
+## Split the Dataset into Training and Test Sets and Perform the Decision Tree Model
+
+```{r}
+
+set.seed(123)
+train_index <- createDataPartition(merged_data_svr$delivered_cases, p = 0.8, list = FALSE)
+
+train_data <- merged_data_svr[train_index, ]
+test_data  <- merged_data_svr[-train_index, ]
+
+# Train decision tree for regression
+dt_model <- rpart(delivered_cases ~ ., data = train_data, method = "anova",
+                  control = rpart.control(maxdepth = 4, minsplit = 20, cp = 0.01))
+
+# Identify optimal complexity parameter (cp) for pruning
+printcp(dt_model)
+
+# Prune the tree using the best cp value
+pruned_tree <- prune(dt_model, cp = dt_model$cptable[which.min(dt_model$cptable[, "xerror"]), "CP"])
+
+# Plot pruned tree
+rpart.plot(dt_model, type = 1, extra = 1, box.palette = "Blues", under = TRUE, tweak = 0.7, cex = 0.5, clip.right.labs = FALSE)
+
+# Predictions & RMSE evaluation
+predictions <- predict(dt_model, newdata = test_data)
+rmse <- sqrt(mean((predictions - test_data$delivered_cases)^2))
+print(paste("RMSE:", rmse))
+
+
+```
+
+## Setting up for the Model
+
+```{r}
+
+library(randomForest)
+
+set.seed(123)  # Ensure reproducibility
+
+sapply(train_data, function(x) if(is.factor(x)) length(unique(x)))
+
+# Ensure the date columns are in Date format
+train_data <- train_data %>%
+  mutate(first_delivery_date = as.Date(first_delivery_date, format = "%Y-%m-%d"),
+         on_boarding_date = as.Date(on_boarding_date, format = "%Y-%m-%d"),
+         transaction_date = as.Date(transaction_date, format = "%Y-%m-%d"))
+
+test_data <- test_data %>%
+  mutate(first_delivery_date = as.Date(first_delivery_date, format = "%Y-%m-%d"),
+         on_boarding_date = as.Date(on_boarding_date, format = "%Y-%m-%d"),
+         transaction_date = as.Date(transaction_date, format = "%Y-%m-%d"))
+
+# Extract the year from date columns
+train_data <- train_data %>%
+  mutate(first_delivery_year = as.numeric(format(first_delivery_date, "%Y")),
+         on_boarding_year = as.numeric(format(on_boarding_date, "%Y")),
+         transaction_year = as.numeric(format(transaction_date, "%Y"))) %>%
+  select(-first_delivery_date, -on_boarding_date, -transaction_date)  # Drop original columns
+
+test_data <- test_data %>%
+  mutate(first_delivery_year = as.numeric(format(first_delivery_date, "%Y")),
+         on_boarding_year = as.numeric(format(on_boarding_date, "%Y")),
+         transaction_year = as.numeric(format(transaction_date, "%Y"))) %>%
+  select(-first_delivery_date, -on_boarding_date, -transaction_date)
+
+# Remove date columns or transform them into numeric features (if not done earlier)
+merged_data_svr <- merged_data_svr %>%
+  mutate(first_delivery_year = as.numeric(format(as.Date(first_delivery_date, format="%Y-%m-%d"), "%Y")),
+         on_boarding_year = as.numeric(format(as.Date(on_boarding_date, format="%Y-%m-%d"), "%Y")),
+         transaction_year = as.numeric(format(as.Date(transaction_date, format="%Y-%m-%d"), "%Y"))) %>%
+  select(-transaction_date, -first_delivery_date, -on_boarding_date)  # Remove original date columns
+
+# Apply dummy encoding before train-test split
+dummies <- dummyVars(delivered_cases ~ ., data = merged_data_svr)
+
+# Convert the entire dataset into numeric format
+merged_data_svr_numeric <- predict(dummies, newdata = merged_data_svr) %>% as.data.frame()
+
+set.seed(123)
+train_index <- createDataPartition(merged_data_svr_numeric$delivered_cases, p = 0.8, list = FALSE)
+
+train_data <- merged_data_svr_numeric[train_index, ]
+test_data  <- merged_data_svr_numeric[-train_index, ]
+
+
+
+```
+
+```
+## The Target Segment Variable
+```{r}
+# Load necessary package
+library(dplyr)
+
+customer_segments <- merged_data_svr %>%
+  group_by(customer_number) %>%
+  summarise(total_cases = sum(delivered_cases, na.rm = TRUE)) %>%
+  mutate(segment = case_when(
+    total_cases == 0 ~ "Inactive",
+    total_cases < 100 ~ "Low",
+    total_cases < 500 ~ "Medium",
+    TRUE ~ "High"
+  ))
+
+```
+
+## Prepare data for Classification Tree
+
+```{r}
+
+library(rpart)
+library(rpart.plot)
+
+# Put customer_segments back into the dataset
+segmentation_data <- merged_data_svr %>%
+  left_join(customer_segments, by = "customer_number") %>%
+  filter(!is.na(segment))  # Keep only customers with a segment label
+
+# Ensure categorical variables are factors
+segmentation_data <- segmentation_data %>%
+  mutate(segment = factor(segment)) %>%
+  select(-customer_number, -delivered_cases)  # Drop identifiers & target proxies
+
+# Split data
+set.seed(123)
+train_index <- createDataPartition(segmentation_data$segment, p = 0.8, list = FALSE)
+train_seg <- segmentation_data[train_index, ]
+test_seg  <- segmentation_data[-train_index, ]
+
+```
+
+## Train the classification tree
+
+```{r}
+
+library(ranger)
+
+# Create the classification model with "ranger" package
+segment_model <- ranger(
+  formula = segment ~ ., 
+  data = train_seg,
+  num.trees = 1,           # Only one tree (like a decision tree)
+  max.depth = 3,           # Limit depth for speed
+  min.node.size = 100,     # Minimum number of samples in a terminal node
+  classification = TRUE,
+  importance = "impurity"
+)
+
+# Results from the classification model
+preds <- predict(segment_model, data = test_seg)$predictions
+confusionMatrix(preds, test_seg$segment)
+
+```
+
+## Classification Tree for Specific Customer
+
+```{r}
+
+features <- c("delivered_cases", "delivered_gallons", "median_delivery_cost",
+              "cold_drink_channel", "trade_channel", "frequent_order_type")
+
+library(ranger)
+
+set.seed(42)
+merged_data_svr$dummy_segment <- as.factor(
+  sample(c("A", "B"), nrow(merged_data_svr), replace = TRUE)
+)
+
+# Train a single tree with shallow depth for segmentation
+segment_model_2 <- ranger(
+  formula = dummy_segment ~ ., 
+  data = merged_data_svr[, c("dummy_segment", features)], 
+  num.trees = 1,
+  max.depth = 4,
+  min.node.size = 100,
+  classification = TRUE,
+  write.forest = TRUE
+)
+
+merged_data_svr$segment_node <- predict(
+  segment_model_2, 
+  data = merged_data_svr[, features], 
+  type = "terminalNodes"
+)$predictions
+
+```
+
+## Profiling Each Segment
+
+```{r}
+
+merged_data_svr$segment_node
+
+library(dplyr)
+
+segment_profiles <- merged_data_svr %>%
+  group_by(segment_node) %>%
+  summarise(
+    n_customers = n(),
+    avg_cases = mean(delivered_cases, na.rm = TRUE),
+    avg_gallons = mean(delivered_gallons, na.rm = TRUE),
+    avg_cost = mean(median_delivery_cost, na.rm = TRUE),
+    top_channel = names(sort(table(cold_drink_channel), decreasing = TRUE)[1]),
+    top_trade = names(sort(table(trade_channel), decreasing = TRUE)[1])
+  ) %>%
+  arrange(desc(n_customers))
+
+print(segment_profiles)
+
+```
+
+## Visualizing the Segments
+
+```{r}
+
+library(ggplot2)
+
+merged_data_svr %>%
+  count(segment_node) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  ggplot(aes(x = as.factor(segment_node), y = n)) +
+  geom_col(fill = "darkgreen") +
+  geom_text(aes(label = paste0(pct, "%")), vjust = -0.5, size = 3.5) +
+  labs(title = "Segment Size (% of Total Customers)",
+       x = "Segment", y = "Customer Count") +
+  theme_minimal()
+
+
+```
+
+## Making Adjustments to the Model
+
+```{r}
+
+segment_model_2 <- ranger(
+  dummy_segment ~ ., 
+  data = merged_data_svr[, c("dummy_segment", features)], 
+  num.trees = 1,
+  max.depth = 5,
+  min.node.size = 100,
+  classification = TRUE,
+  write.forest = TRUE
+)
+
+merged_data_svr$segment_node <- predict(segment_model_2, data = merged_data_svr[, features], type = "terminalNodes")$predictions
+
+```
+
+## Visualizing this new Skew
+
+```{r}
+
+merged_data_svr %>%
+  count(segment_node) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  ggplot(aes(x = as.factor(segment_node), y = pct)) +
+  geom_col(fill = "coral") +
+  geom_text(aes(label = paste0(pct, "%")), vjust = -0.5, size = 3.5) +
+  labs(title = "Segment Share by Tree Leaf Node",
+       x = "Segment (Leaf Node)", y = "Percentage of Customers") +
+  theme_minimal()
+
+```
+
+## Node 28
+
+```{r}
+
+segment_28_customers <- merged_data_svr %>%
+  filter(segment_node == 28)
+
+segment_28_summary <- segment_28_customers %>%
+  summarise(
+    n_customers = n(),
+    avg_cases = mean(delivered_cases, na.rm = TRUE),
+    avg_gallons = mean(delivered_gallons, na.rm = TRUE),
+    avg_cost = mean(median_delivery_cost, na.rm = TRUE),
+    top_channel = names(sort(table(cold_drink_channel), decreasing = TRUE)[1]),
+    top_trade_channel = names(sort(table(trade_channel), decreasing = TRUE)[1])
+  )
+print(segment_28_summary)
+
+library(ggplot2)
+
+merged_data_svr %>%
+  mutate(in_segment_28 = ifelse(segment_node == 28, "Segment 28", "Other")) %>%
+  ggplot(aes(x = delivered_cases, fill = in_segment_28)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Delivered Cases: Segment 28 vs Others", x = "Delivered Cases", fill = "Group")
+
+```
+
+## Comparing Segment 28 to the Others
+
+```{r}
+
+comparison <- merged_data_svr %>%
+  mutate(in_segment_28 = ifelse(segment_node == 28, "Segment 28", "Other")) %>%
+  group_by(in_segment_28) %>%
+  summarise(
+    avg_cases = mean(delivered_cases, na.rm = TRUE),
+    avg_gallons = mean(delivered_gallons, na.rm = TRUE),
+    avg_cost = mean(median_delivery_cost, na.rm = TRUE),
+    n_customers = n()
+  )
+print(comparison)
+
+```
+
